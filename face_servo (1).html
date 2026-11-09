@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>얼굴 → 서보</title>
+<style>
+  body{font-family:sans-serif;margin:0;padding:12px;background:#111;color:#eee}
+  video{width:100%;max-width:640px;transform:scaleX(-1);background:#000;border-radius:8px}
+  button{font-size:18px;padding:12px 14px;margin:4px 4px 4px 0;border-radius:8px;border:0;background:#2d6cdf;color:#fff}
+  button.sub{background:#444}
+  label{display:block;margin:8px 0;font-size:18px}
+  #info{font-size:20px;margin:8px 0;line-height:1.5}
+</style>
+</head>
+<body>
+<h3>얼굴 → 마이크로비트 서보</h3>
+<video id="v" autoplay playsinline muted></video>
+<div>
+  <button id="bCam">1. 카메라 시작</button>
+  <button id="bUsb">2. 마이크로비트 연결</button>
+</div>
+<div id="info">대기 중</div>
+<div>
+  <button class="sub" id="bCenter">정면 맞추기</button>
+  <button class="sub" id="bClosed">입 닫은 기준</button>
+  <button class="sub" id="bOpen">입 최대로 연 기준</button>
+</div>
+<label><input type="checkbox" id="flip"> 좌우 방향 반전 (목이 반대로 돌 때)</label>
+<div id="msg"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder();
+
+// 아래 값은 버튼으로 조정되고 자동 저장됩니다
+const cfg = { yawOffset: 0, flip: false, jawClosed: 0.03, jawOpen: 0.5 };
+try { Object.assign(cfg, JSON.parse(localStorage.getItem('face_servo') || '{}')); } catch (e) {}
+const save = () => { try { localStorage.setItem('face_servo', JSON.stringify(cfg)); } catch (e) {} };
+
+let landmarker = null, writer = null, busy = false, lastSend = 0, lastT = -1;
+let yawRaw = 0, jawRaw = 0;
+$('flip').checked = cfg.flip;
+$('flip').onchange = () => { cfg.flip = $('flip').checked; save(); };
+
+const msg = t => { $('msg').textContent = t; };
+
+$('bCam').onclick = async () => {
+  try {
+    msg('카메라/모델 불러오는 중...');
+    $('v').srcObject = await navigator.mediaDevices.getUserMedia(
+      { video: { facingMode: 'user', width: 640, height: 480 }, audio: false });
+    const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks_vision@0.10.14/vision_bundle.mjs');
+    const fileset = await vision.FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks_vision@0.10.14/wasm');
+    const opts = {
+      baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate: 'GPU' },
+      runningMode: 'VIDEO', numFaces: 1,
+      outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true
+    };
+    try { landmarker = await vision.FaceLandmarker.createFromOptions(fileset, opts); }
+    catch (e) { opts.baseOptions.delegate = 'CPU'; landmarker = await vision.FaceLandmarker.createFromOptions(fileset, opts); }
+    msg('카메라 준비 완료');
+    loop();
+  } catch (e) { msg('카메라 오류: ' + e.message); }
+};
+
+$('bUsb').onclick = async () => {
+  try {
+    if (!('serial' in navigator)) { msg('이 브라우저/주소에서는 Web Serial을 쓸 수 없어요 (크롬 최신 버전, file:// 또는 https 주소 필요)'); return; }
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    msg('마이크로비트 연결됨');
+  } catch (e) { msg('USB 오류: ' + e.message); }
+};
+
+$('bCenter').onclick = () => { cfg.yawOffset = yawRaw; save(); msg('정면 기준 저장'); };
+$('bClosed').onclick = () => { cfg.jawClosed = jawRaw; save(); msg('입 닫은 기준 저장'); };
+$('bOpen').onclick = () => { cfg.jawOpen = Math.max(jawRaw, cfg.jawClosed + 0.05); save(); msg('입 최대 기준 저장'); };
+
+function values() {
+  const yaw = (yawRaw - cfg.yawOffset) * (cfg.flip ? -1 : 1);
+  const m = (jawRaw - cfg.jawClosed) / (cfg.jawOpen - cfg.jawClosed);
+  return { yaw, mouth: Math.min(1, Math.max(0, m)) * 100 };
+}
+
+async function send() {
+  const now = performance.now();
+  if (!writer || busy || now - lastSend < 40) return;
+  lastSend = now; busy = true;
+  const v = values();
+  try { await writer.write(enc.encode(v.yaw.toFixed(1) + ',' + Math.round(v.mouth) + '\n')); }
+  catch (e) { msg('전송 오류: ' + e.message); writer = null; }
+  busy = false;
+}
+
+function loop() {
+  const video = $('v');
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const r = landmarker.detectForVideo(video, performance.now());
+    if (r.faceLandmarks.length) {
+      const m = r.facialTransformationMatrixes[0].data;
+      yawRaw = Math.atan2(m[8], m[10]) * 180 / Math.PI;
+      const c = r.faceBlendshapes[0].categories.find(x => x.categoryName === 'jawOpen');
+      jawRaw = c ? c.score : 0;
+      const v = values();
+      $('info').innerHTML = '목 좌우: ' + v.yaw.toFixed(0) + '°<br>입 열림: ' + v.mouth.toFixed(0) + '%';
+      send();
+    } else {
+      $('info').textContent = '얼굴이 안 보여요';
+    }
+  }
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
